@@ -7,13 +7,17 @@ import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.models as models
 
 
 def init_seeds(seed=0):
     torch.manual_seed(seed)
 
-    # Reduce randomness (may be slower on Tesla GPUs) # https://pytorch.org/docs/stable/notes/randomness.html
-    if seed == 0:
+    # Speed-reproducibility tradeoff https://pytorch.org/docs/stable/notes/randomness.html
+    if seed == 0:  # slower, more reproducible
+        cudnn.deterministic = True
+        cudnn.benchmark = False
+    else:  # faster, less reproducible
         cudnn.deterministic = False
         cudnn.benchmark = True
 
@@ -87,7 +91,7 @@ def fuse_conv_and_bn(conv, bn):
         if conv.bias is not None:
             b_conv = conv.bias
         else:
-            b_conv = torch.zeros(conv.weight.size(0))
+            b_conv = torch.zeros(conv.weight.size(0), device=conv.weight.device)
         b_bn = bn.bias - bn.weight.mul(bn.running_mean).div(torch.sqrt(bn.running_var + bn.eps))
         fusedconv.bias.copy_(torch.mm(w_bn, b_conv.reshape(-1, 1)).reshape(-1) + b_bn)
 
@@ -117,28 +121,32 @@ def model_info(model, verbose=False):
 
 def load_classifier(name='resnet101', n=2):
     # Loads a pretrained model reshaped to n-class output
-    import pretrainedmodels  # https://github.com/Cadene/pretrained-models.pytorch#torchvision
-    model = pretrainedmodels.__dict__[name](num_classes=1000, pretrained='imagenet')
+    model = models.__dict__[name](pretrained=True)
 
     # Display model properties
-    for x in ['model.input_size', 'model.input_space', 'model.input_range', 'model.mean', 'model.std']:
+    input_size = [3, 224, 224]
+    input_space = 'RGB'
+    input_range = [0, 1]
+    mean = [0.485, 0.456, 0.406]
+    std = [0.229, 0.224, 0.225]
+    for x in [input_size, input_space, input_range, mean, std]:
         print(x + ' =', eval(x))
 
     # Reshape output to n classes
-    filters = model.last_linear.weight.shape[1]
-    model.last_linear.bias = torch.nn.Parameter(torch.zeros(n))
-    model.last_linear.weight = torch.nn.Parameter(torch.zeros(n, filters))
-    model.last_linear.out_features = n
+    filters = model.fc.weight.shape[1]
+    model.fc.bias = torch.nn.Parameter(torch.zeros(n), requires_grad=True)
+    model.fc.weight = torch.nn.Parameter(torch.zeros(n, filters), requires_grad=True)
+    model.fc.out_features = n
     return model
 
 
-def scale_img(img, ratio=1.0, same_shape=True):  # img(16,3,256,416), r=ratio
+def scale_img(img, ratio=1.0, same_shape=False):  # img(16,3,256,416), r=ratio
     # scales img(bs,3,y,x) by ratio
     h, w = img.shape[2:]
     s = (int(h * ratio), int(w * ratio))  # new size
     img = F.interpolate(img, size=s, mode='bilinear', align_corners=False)  # resize
     if not same_shape:  # pad/crop img
-        gs = 64  # (pixels) grid size
+        gs = 32  # (pixels) grid size
         h, w = [math.ceil(x * ratio / gs) * gs for x in (h, w)]
     return F.pad(img, [0, w - s[1], 0, h - s[0]], value=0.447)  # value = imagenet mean
 

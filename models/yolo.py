@@ -1,8 +1,6 @@
 import argparse
 
-import yaml
-
-from models.common import *
+from models.experimental import *
 
 
 class Detect(nn.Module):
@@ -20,7 +18,7 @@ class Detect(nn.Module):
         self.export = False  # onnx export
 
     def forward(self, x):
-        x = x.copy()
+        # x = x.copy()  # for profiling
         z = []  # inference output
         self.training |= self.export
         for i in range(self.nl):
@@ -32,7 +30,7 @@ class Detect(nn.Module):
                     self.grid[i] = self._make_grid(nx, ny).to(x[i].device)
 
                 y = x[i].sigmoid()
-                y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
+                y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid[i].to(x[i].device)) * self.stride[i]  # xy
                 y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
                 z.append(y.view(bs, -1, self.no))
 
@@ -45,19 +43,25 @@ class Detect(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(self, model_yaml='yolov5s.yaml'):  # cfg, number of classes, depth-width gains
+    def __init__(self, model_cfg='yolov5s.yaml', ch=3, nc=None):  # model, input channels, number of classes
         super(Model, self).__init__()
-        with open(model_yaml) as f:
-            self.md = yaml.load(f, Loader=yaml.FullLoader)  # model dict
+        if type(model_cfg) is dict:
+            self.md = model_cfg  # model dict
+        else:  # is *.yaml
+            with open(model_cfg) as f:
+                self.md = yaml.load(f, Loader=yaml.FullLoader)  # model dict
 
         # Define model
-        self.model, self.save, ch = parse_model(self.md, ch=[3])  # model, savelist, ch_out
-        # print([x.shape for x in self.forward(torch.zeros(1, 3, 64, 64))])
+        if nc:
+            self.md['nc'] = nc  # override yaml value
+        self.model, self.save = parse_model(self.md, ch=[ch])  # model, savelist, ch_out
+        # print([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
 
         # Build strides, anchors
         m = self.model[-1]  # Detect()
-        m.stride = torch.tensor([64 / x.shape[-2] for x in self.forward(torch.zeros(1, 3, 64, 64))])  # forward
+        m.stride = torch.tensor([128 / x.shape[-2] for x in self.forward(torch.zeros(1, ch, 128, 128))])  # forward
         m.anchors /= m.stride.view(-1, 1, 1)
+        check_anchor_order(m)
         self.stride = m.stride
 
         # Init weights, biases
@@ -67,26 +71,47 @@ class Model(nn.Module):
         print('')
 
     def forward(self, x, augment=False, profile=False):
-        y, ts = [], 0  # outputs
+        if augment:
+            img_size = x.shape[-2:]  # height, width
+            s = [0.83, 0.67]  # scales
+            y = []
+            for i, xi in enumerate((x,
+                                    torch_utils.scale_img(x.flip(3), s[0]),  # flip-lr and scale
+                                    torch_utils.scale_img(x, s[1]),  # scale
+                                    )):
+                # cv2.imwrite('img%g.jpg' % i, 255 * xi[0].numpy().transpose((1, 2, 0))[:, :, ::-1])
+                y.append(self.forward_once(xi)[0])
+
+            y[1][..., :4] /= s[0]  # scale
+            y[1][..., 0] = img_size[1] - y[1][..., 0]  # flip lr
+            y[2][..., :4] /= s[1]  # scale
+            return torch.cat(y, 1), None  # augmented inference, train
+        else:
+            return self.forward_once(x, profile)  # single-scale inference, train
+
+    def forward_once(self, x, profile=False):
+        y, dt = [], []  # outputs
         for m in self.model:
             if m.f != -1:  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
 
             if profile:
-                import thop
-                o = thop.profile(m, inputs=(x,), verbose=False)[0] / 1E9 * 2  # FLOPS
+                try:
+                    import thop
+                    o = thop.profile(m, inputs=(x,), verbose=False)[0] / 1E9 * 2  # FLOPS
+                except:
+                    o = 0
                 t = torch_utils.time_synchronized()
                 for _ in range(10):
                     _ = m(x)
-                dt = torch_utils.time_synchronized() - t
-                ts += dt
-                print('%10.1f%10.0f%10.1fms %-40s' % (o, m.np, dt * 100, m.type))
+                dt.append((torch_utils.time_synchronized() - t) * 100)
+                print('%10.1f%10.0f%10.1fms %-40s' % (o, m.np, dt[-1], m.type))
 
             x = m(x)  # run
             y.append(x if m.i in self.save else None)  # save output
 
         if profile:
-            print(ts * 100)
+            print('%.1fms total' % sum(dt))
         return x
 
     def _initialize_biases(self, cf=None):  # initialize biases into Detect(), cf is class frequency
@@ -105,6 +130,20 @@ class Model(nn.Module):
             b = self.model[f].bias.detach().view(m.na, -1).T  # conv.bias(255) to (3,85)
             print(('%g Conv2d.bias:' + '%10.3g' * 6) % (f, *b[:5].mean(1).tolist(), b[5:].mean()))
 
+    # def _print_weights(self):
+    #     for m in self.model.modules():
+    #         if type(m) is Bottleneck:
+    #             print('%10.3g' % (m.w.detach().sigmoid() * 2))  # shortcut weights
+
+    def fuse(self):  # fuse model Conv2d() + BatchNorm2d() layers
+        print('Fusing layers...')
+        for m in self.model.modules():
+            if type(m) is Conv:
+                m.conv = torch_utils.fuse_conv_and_bn(m.conv, m.bn)  # update conv
+                m.bn = None  # remove batchnorm
+                m.forward = m.fuseforward  # update forward
+        torch_utils.model_info(self)
+
 
 def parse_model(md, ch):  # model_dict, input_channels(3)
     print('\n%3s%15s%3s%10s  %-40s%-30s' % ('', 'from', 'n', 'params', 'module', 'arguments'))
@@ -122,7 +161,7 @@ def parse_model(md, ch):  # model_dict, input_channels(3)
                 pass
 
         n = max(round(n * gd), 1) if n > 1 else n  # depth gain
-        if m in [nn.Conv2d, Conv, Bottleneck, SPP, DWConv, MixConv2d, Focus, ConvPlus, BottleneckCSP, BottleneckCSPF, BottleneckLight]:
+        if m in [nn.Conv2d, Conv, Bottleneck, SPP, DWConv, MixConv2d, Focus, ConvPlus, BottleneckCSP]:
             c1, c2 = ch[f], args[0]
 
             # Normal
@@ -143,15 +182,13 @@ def parse_model(md, ch):  # model_dict, input_channels(3)
             #     c2 = make_divisible(c2, 8) if c2 != no else c2
 
             args = [c1, c2, *args[1:]]
-            if m in [BottleneckCSP, BottleneckCSPF]:
-                args += [n]
+            if m is BottleneckCSP:
+                args.insert(2, n)
                 n = 1
         elif m is nn.BatchNorm2d:
             args = [ch[f]]
         elif m is Concat:
-            c2 = sum([ch[x] for x in f])
-        elif m is Origami:
-            c2 = ch[f] * 5
+            c2 = sum([ch[-1 if x == -1 else x + 1] for x in f])
         elif m is Detect:
             f = f or list(reversed([(-1 if j == i else j - 1) for j, x in enumerate(ch) if x == no]))
         else:
@@ -165,7 +202,7 @@ def parse_model(md, ch):  # model_dict, input_channels(3)
         save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
         layers.append(m_)
         ch.append(c2)
-    return nn.Sequential(*layers), sorted(save), ch
+    return nn.Sequential(*layers), sorted(save)
 
 
 if __name__ == '__main__':
@@ -173,7 +210,7 @@ if __name__ == '__main__':
     parser.add_argument('--cfg', type=str, default='yolov5s.yaml', help='model.yaml')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     opt = parser.parse_args()
-    opt.cfg = glob.glob('./**/' + opt.cfg, recursive=True)[0]  # find file
+    opt.cfg = check_file(opt.cfg)  # check file
     device = torch_utils.select_device(opt.device)
 
     # Create model
@@ -183,11 +220,10 @@ if __name__ == '__main__':
     # Profile
     # img = torch.rand(8 if torch.cuda.is_available() else 1, 3, 640, 640).to(device)
     # y = model(img, profile=True)
-    # print([y[0].shape] + [x.shape for x in y[1]])
 
     # ONNX export
     # model.model[-1].export = True
-    # torch.onnx.export(model, img, f.replace('.yaml', '.onnx'), verbose=True, opset_version=11)
+    # torch.onnx.export(model, img, opt.cfg.replace('.yaml', '.onnx'), verbose=True, opset_version=11)
 
     # Tensorboard
     # from torch.utils.tensorboard import SummaryWriter
